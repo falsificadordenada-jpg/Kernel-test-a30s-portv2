@@ -13,6 +13,7 @@
 
 #define NO_MONITOR 1
 #define NO_ECORE   1
+#define CORE_NCTRS 6   /* A53 PMU; KPC desligado no A30S, define so por seguranca */
 
 #ifndef ASSEMBLER
 

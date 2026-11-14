@@ -22,6 +22,13 @@
 #include <pexpert/pexpert.h>
 #include <libkern/libkern.h>
 
+/*
+ * Declared explicitly: the BSD side does not see the prototype in the machine
+ * headers, and an implicit declaration would truncate the returned kernel
+ * virtual address to 32 bits.
+ */
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
 
 #define EMMC_PHYS_BASE          0x13500000UL   /* Exynos 7904 DW-MMC0 */
 #define EMMC_REG_SIZE           0x2000u
@@ -764,103 +771,4 @@ static const struct cdevsw a30s_emmc_cdevsw = {
 	.d_reset      = eno_reset,
 	.d_ttys       = NULL,
 	.d_select     = eno_select,
-	.d_mmap       = eno_mmap,
-	.d_strategy   = eno_strat,
-	.d_reserved_1 = eno_getc,
-	.d_reserved_2 = eno_putc,
-	.d_type       = D_DISK,
-};
-
-static int
-emmc_map_controller(void)
-{
-	if (se.regs != 0) {
-		return 0;
-	}
-	se.regs = ml_io_map((vm_offset_t)EMMC_PHYS_BASE, (vm_size_t)EMMC_REG_SIZE);
-	return se.regs == 0 ? ENXIO : 0;
-}
-
-static int
-a30s_emmc_init(void)
-{
-	char partition[64] = "userdata";
-	uint32_t rw = 0;
-	int error = emmc_map_controller();
-
-	if (error != 0) {
-		return error;
-	}
-	uint32_t force = 0;
-
-	PE_parse_boot_argn("emmcroot", partition, sizeof(partition));
-	PE_parse_boot_argn("emmcw", &rw, sizeof(rw));
-	PE_parse_boot_argn("emmc_force", &force, sizeof(force));
-	if (a30s_emmc_lock == NULL) {
-		a30s_emmc_grp = lck_grp_alloc_init("a30s_emmc", LCK_GRP_ATTR_NULL);
-		a30s_emmc_lock = lck_mtx_alloc_init(a30s_emmc_grp, LCK_ATTR_NULL);
-	}
-	if (!force && (emmc_rd(REG_VERID) != 0x5342270au ||
-	    emmc_rd(REG_HCON) != 0x08e42541u ||
-	    ((emmc_rd(REG_CLKSEL) >> 24) & 7u) != 3u ||
-	    !(emmc_rd(REG_PWREN) & 1u) || !(emmc_rd(REG_CLKENA) & 1u))) {
-		printf("A30S eMMC: unexpected controller handoff (ver=%08x hcon=%08x clksel=%08x)\n",
-		    emmc_rd(REG_VERID), emmc_rd(REG_HCON), emmc_rd(REG_CLKSEL));
-		return ENXIO;
-	}
-	if (!force && (emmc_rd(REG_CTRL) & (CTRL_DMA_ENABLE | CTRL_USE_IDMAC))) {
-		printf("A30S eMMC: refusing host with DMA active (ctrl=%08x)\n",
-		    emmc_rd(REG_CTRL));
-		return ENXIO;
-	}
-	emmc_wr(REG_INTMASK, 0);
-	emmc_wr(REG_CTRL, emmc_rd(REG_CTRL) & ~CTRL_INT_ENABLE);
-	se.secsize = DEV_BSIZE;
-
-	lck_mtx_lock(a30s_emmc_lock);
-	error = emmc_initialize_card();
-	if (!error) {
-		error = emmc_find_partition(partition);
-	}
-	lck_mtx_unlock(a30s_emmc_lock);
-	if (error) {
-		printf("A30S eMMC: initialization failed: %d\n", error);
-		return error;
-	}
-	se.bmajor = bdevsw_add(-1, &a30s_emmc_bdevsw);
-	if (se.bmajor < 0) {
-		return ENXIO;
-	}
-	se.cmajor = cdevsw_add_with_bdev(-1, &a30s_emmc_cdevsw, se.bmajor);
-	if (se.cmajor < 0) {
-		return ENXIO;
-	}
-	se.bdev = makedev(se.bmajor, 0);
-	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
-	    "emmcroot0");
-	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT,
-	    GID_OPERATOR, 0640, "remmcroot0");
-	/* Enable writes only after the selected partition has been bounded. */
-	se.writable = (rw == 1);
-	se.ready = true;
-	printf("A30S eMMC: \"%s\": LBA 0x%llx, %llu MiB, %s, 8-bit PIO\n",
-	    partition, se.first_sector,
-	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
-	    se.writable ? "read-write" : "read-only");
-	return 0;
-}
-
-int
-a30s_emmc_rootdev(dev_t *dev)
-{
-	if (!se.ready) {
-		int error = a30s_emmc_init();
-		if (error != 0) {
-			return error;
-		}
-	}
-	*dev = se.bdev;
-	return 0;
-}
-
-#endif /* ARM64_BOARD_CONFIG_A30S */
+	.d_mmap       = eno_

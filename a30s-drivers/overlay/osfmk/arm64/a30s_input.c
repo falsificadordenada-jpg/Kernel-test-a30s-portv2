@@ -22,6 +22,9 @@
 #include <machine/machine_routines.h>
 #include "a30s_input.h"
 
+/* Explicit prototype: without it the 64-bit mapping address could be truncated to int. */
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
 #define PIN_BASE   0x11CB0000UL   /* ALIVE pin controller */
 #define TOP_PIN    0x139B0000UL   /* TOP pin controller */
 #define I2C4_BASE  0x13870000UL

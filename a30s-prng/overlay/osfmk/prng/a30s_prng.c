@@ -16,6 +16,9 @@
 #include <corecrypto/cckprng.h>
 #include <corecrypto/cc_error.h>
 
+/* Explicit prototype: guarded by MACH_KERNEL_PRIVATE in the machine headers. */
+extern uint64_t ml_get_timebase(void);
+
 #if defined(ARM64_BOARD_CONFIG_A30S)
 
 static uint64_t a30s_rng_s[4];

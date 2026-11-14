@@ -67,6 +67,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define CMD_RESP_CRC            (1u << 8)
 #define CMD_RESP_LONG           (1u << 7)
 #define CMD_RESP_EXPECT         (1u << 6)
+#define CTRL_FIFO_RESET         (1u << 1)
 #define CTRL_INT_ENABLE         (1u << 4)
 #define CTRL_DMA_ENABLE         (1u << 5)
 #define CTRL_USE_IDMAC          (1u << 25)
@@ -153,6 +154,24 @@ emmc_wait_clear(uint32_t off, uint32_t mask, uint64_t deadline)
 		}
 	}
 	return 0;
+}
+
+/*
+ * Empty the data FIFO. The bootloader (or an aborted transfer) can leave words in it,
+ * which would be read as the start of the next block and leave the controller stuck
+ * with a full FIFO.
+ */
+static void
+emmc_fifo_reset(void)
+{
+	uint64_t deadline = emmc_deadline(100ull * NSEC_PER_MSEC);
+
+	emmc_wr(REG_CTRL, emmc_rd(REG_CTRL) | CTRL_FIFO_RESET);
+	while (emmc_rd(REG_CTRL) & CTRL_FIFO_RESET) {
+		if (mach_absolute_time() >= deadline) {
+			break;
+		}
+	}
 }
 
 static int
@@ -244,6 +263,7 @@ emmc_data_command(uint32_t index, uint32_t argument, bool write,
 	if (blocks == 0 || blocks > EMMC_MAX_BLOCKS) {
 		return EINVAL;
 	}
+	emmc_fifo_reset();
 	emmc_wr(REG_BLKSIZ, EMMC_BLOCK_SIZE);
 	emmc_wr(REG_BYTCNT, bytes);
 	emmc_wr(REG_RINTSTS, 0xffffffffu);
@@ -408,6 +428,7 @@ emmc_initialize_card_inner(void)
 	uint32_t sector_count;
 	int error;
 
+	emmc_fifo_reset();
 	/* Keep initial negotiation at <=400 kHz, independent of parent rate. */
 	if ((error = emmc_set_clock_divider(0xff)) != 0) {
 		return error;
@@ -449,6 +470,7 @@ emmc_initialize_card_inner(void)
 	if ((error = emmc_wait_not_busy(emmc_deadline(EMMC_TIMEOUT_NS))) != 0) {
 		return error;
 	}
+	emmc_fifo_reset();
 	emmc_wr(REG_BLKSIZ, EMMC_BLOCK_SIZE);
 	emmc_wr(REG_BYTCNT, EMMC_BLOCK_SIZE);
 	{
@@ -526,6 +548,14 @@ emmc_initialize_card(void)
 		printf("A30S eMMC: rintsts=%08x status=%08x clksel=%08x uhs=%08x ticks/s=%llu\n",
 		    emmc_rd(REG_RINTSTS), emmc_rd(REG_STATUS), emmc_rd(REG_CLKSEL),
 		    emmc_rd(REG_UHS), one_second);
+		/* Drain whatever the failed transfer left in the FIFO, let the controller finish, drain again. */
+		emmc_fifo_reset();
+		{
+			uint64_t settle = emmc_deadline(20ull * NSEC_PER_MSEC);
+			while (mach_absolute_time() < settle) {
+			}
+		}
+		emmc_fifo_reset();
 		/* Do not leave the card clock disabled after a failed attempt. */
 		if (!(emmc_rd(REG_CLKENA) & 1u)) {
 			emmc_wr(REG_CLKENA, emmc_rd(REG_CLKENA) | 1u);

@@ -96,6 +96,8 @@ static struct {
 	dev_t bdev;
 	bool writable;
 	bool ready;
+	bool logged;
+	bool handoff_ok;
 } se;
 
 static uint8_t emmc_gpt_sector[EMMC_BLOCK_SIZE];
@@ -104,6 +106,10 @@ static uint8_t emmc_bounce[EMMC_MAX_XFER + EMMC_BLOCK_SIZE];
 
 static lck_grp_t *a30s_emmc_grp;
 static lck_mtx_t *a30s_emmc_lock;
+
+/* Diagnostics: last step / command that was running when an error happened. */
+static const char *emmc_step = "none";
+static uint32_t emmc_last_cmd;
 
 static inline uint32_t
 emmc_rd(uint32_t off)
@@ -152,6 +158,7 @@ emmc_wait_clear(uint32_t off, uint32_t mask, uint64_t deadline)
 static int
 emmc_wait_not_busy(uint64_t deadline)
 {
+	emmc_step = "wait-not-busy";
 	while (emmc_rd(REG_STATUS) & STATUS_DATA_BUSY) {
 		if (mach_absolute_time() >= deadline) {
 			return ETIMEDOUT;
@@ -164,7 +171,9 @@ static int
 emmc_update_clock(void)
 {
 	uint64_t deadline = emmc_deadline(EMMC_TIMEOUT_NS);
-	emmc_wr(REG_CMD, CMD_START | CMD_UPDATE_CLOCK);
+	emmc_step = "update-clock";
+	/* Same flags as the Linux dw_mmc driver: wait for previous data, then latch the clock. */
+	emmc_wr(REG_CMD, CMD_START | CMD_UPDATE_CLOCK | CMD_WAIT_PRVDATA);
 	return emmc_wait_clear(REG_CMD, CMD_START, deadline);
 }
 
@@ -175,14 +184,17 @@ emmc_set_clock_divider(uint32_t divider)
 	int error;
 
 	emmc_wr(REG_CLKENA, enabled & ~1u);
+	emmc_step = "clock-disable";
 	if ((error = emmc_update_clock()) != 0) {
 		return error;
 	}
 	emmc_wr(REG_CLKDIV, divider);
+	emmc_step = "clock-divider";
 	if ((error = emmc_update_clock()) != 0) {
 		return error;
 	}
 	emmc_wr(REG_CLKENA, enabled | 1u);
+	emmc_step = "clock-enable";
 	return emmc_update_clock();
 }
 
@@ -193,6 +205,8 @@ emmc_cmd(uint32_t index, uint32_t argument, uint32_t flags, uint32_t *response)
 	uint32_t status;
 	int error;
 
+	emmc_last_cmd = index;
+	emmc_step = "command";
 	emmc_wr(REG_RINTSTS, 0xffffffffu);
 	emmc_wr(0x028, argument);
 	emmc_wr(REG_CMD, CMD_START | flags | (index & 0x3fu));
@@ -386,7 +400,7 @@ emmc_flush_cache(void)
 }
 
 static int
-emmc_initialize_card(void)
+emmc_initialize_card_inner(void)
 {
 	uint32_t ocr = 0;
 	uint8_t ext_csd[EMMC_BLOCK_SIZE];
@@ -449,6 +463,7 @@ emmc_initialize_card(void)
 	{
 		uint32_t done = 0;
 		uint64_t data_deadline = emmc_deadline(EMMC_TIMEOUT_NS);
+		emmc_step = "ext-csd-fifo";
 		while (done < sizeof(ext_csd)) {
 			uint32_t status = emmc_rd(REG_STATUS);
 			if (!(status & STATUS_FIFO_EMPTY)) {
@@ -460,6 +475,7 @@ emmc_initialize_card(void)
 				return ETIMEDOUT;
 			}
 		}
+		emmc_step = "ext-csd-done";
 		while (!(emmc_rd(REG_RINTSTS) & INT_DATA_OVER)) {
 			if (emmc_rd(REG_RINTSTS) & INT_ERRORS) {
 				return EIO;
@@ -492,6 +508,31 @@ emmc_initialize_card(void)
 	emmc_wr(REG_CTYPE, 1u << 16);
 	/* 799.5 MHz / (3 + 1) / (2 * 4) = 24.984 MHz, legacy-safe. */
 	return emmc_set_clock_divider(4);
+}
+
+static int
+emmc_initialize_card(void)
+{
+	int error = emmc_initialize_card_inner();
+
+	if (error != 0) {
+		uint64_t one_second;
+		nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_second);
+		printf("A30S eMMC: step \"%s\" (cmd %u) failed: %d\n", emmc_step,
+		    emmc_last_cmd, error);
+		printf("A30S eMMC: ctrl=%08x pwren=%08x clkena=%08x clkdiv=%08x cmd=%08x\n",
+		    emmc_rd(REG_CTRL), emmc_rd(REG_PWREN), emmc_rd(REG_CLKENA),
+		    emmc_rd(REG_CLKDIV), emmc_rd(REG_CMD));
+		printf("A30S eMMC: rintsts=%08x status=%08x clksel=%08x uhs=%08x ticks/s=%llu\n",
+		    emmc_rd(REG_RINTSTS), emmc_rd(REG_STATUS), emmc_rd(REG_CLKSEL),
+		    emmc_rd(REG_UHS), one_second);
+		/* Do not leave the card clock disabled after a failed attempt. */
+		if (!(emmc_rd(REG_CLKENA) & 1u)) {
+			emmc_wr(REG_CLKENA, emmc_rd(REG_CLKENA) | 1u);
+			(void)emmc_update_clock();
+		}
+	}
+	return error;
 }
 
 static int
@@ -803,18 +844,28 @@ a30s_emmc_init(void)
 	PE_parse_boot_argn("emmcroot", partition, sizeof(partition));
 	PE_parse_boot_argn("emmcw", &rw, sizeof(rw));
 	PE_parse_boot_argn("emmc_force", &force, sizeof(force));
+	if (!se.logged) {
+		se.logged = true;
+		printf("A30S eMMC: handoff ctrl=%08x pwren=%08x clkena=%08x clkdiv=%08x clksel=%08x uhs=%08x status=%08x rintsts=%08x\n",
+		    emmc_rd(REG_CTRL), emmc_rd(REG_PWREN), emmc_rd(REG_CLKENA),
+		    emmc_rd(REG_CLKDIV), emmc_rd(REG_CLKSEL), emmc_rd(REG_UHS),
+		    emmc_rd(REG_STATUS), emmc_rd(REG_RINTSTS));
+	}
 	if (a30s_emmc_lock == NULL) {
 		a30s_emmc_grp = lck_grp_alloc_init("a30s_emmc", LCK_GRP_ATTR_NULL);
 		a30s_emmc_lock = lck_mtx_alloc_init(a30s_emmc_grp, LCK_ATTR_NULL);
 	}
-	if (!force && (emmc_rd(REG_VERID) != 0x5342270au ||
+	/* The handoff check only makes sense on the first attempt: a failed attempt changes the clock state itself. */
+	if (!force && !se.handoff_ok && (emmc_rd(REG_VERID) != 0x5342270au ||
 	    emmc_rd(REG_HCON) != 0x08e42541u ||
 	    ((emmc_rd(REG_CLKSEL) >> 24) & 7u) != 3u ||
 	    !(emmc_rd(REG_PWREN) & 1u) || !(emmc_rd(REG_CLKENA) & 1u))) {
-		printf("A30S eMMC: unexpected controller handoff (ver=%08x hcon=%08x clksel=%08x)\n",
-		    emmc_rd(REG_VERID), emmc_rd(REG_HCON), emmc_rd(REG_CLKSEL));
+		printf("A30S eMMC: unexpected controller handoff (ver=%08x hcon=%08x clksel=%08x pwren=%08x clkena=%08x)\n",
+		    emmc_rd(REG_VERID), emmc_rd(REG_HCON), emmc_rd(REG_CLKSEL),
+		    emmc_rd(REG_PWREN), emmc_rd(REG_CLKENA));
 		return ENXIO;
 	}
+	se.handoff_ok = true;
 	if (!force && (emmc_rd(REG_CTRL) & (CTRL_DMA_ENABLE | CTRL_USE_IDMAC))) {
 		printf("A30S eMMC: refusing host with DMA active (ctrl=%08x)\n",
 		    emmc_rd(REG_CTRL));

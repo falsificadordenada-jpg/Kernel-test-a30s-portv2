@@ -51,6 +51,13 @@
 #define FSIOC_CAS_BSDFLAGS _IOWR('A', 2, uint64_t[2])
 #endif
 
+/*
+ * In the kext view of the headers these KPIs are plain names, which the kext linker
+ * maps to the kernel's *_external entry points. Built in, we call those directly.
+ */
+#define kalloc kalloc_external
+#define ubc_create_upl ubc_create_upl_external
+
 /* Built in, not a loadable kext (see a30s_hfs_glue.c). */
 #define OSKextGetCurrentLoadTag a30s_hfs_current_load_tag
 

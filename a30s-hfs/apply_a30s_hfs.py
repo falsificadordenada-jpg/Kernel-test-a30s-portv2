@@ -74,6 +74,16 @@ def stage_hfs(root):
     i, j = text.index(first), text.index(end)
     text = text[:i] + "#if CONFIG_PROTECT\n" + text[i:j].rstrip("\n") + "\n#endif\n\n" + text[j:]
     open(path, "w").write(text)
+
+    # hfs_encodings.h is empty when TARGET_OS_IPHONE is set (Apple's iOS build has no
+    # encoding converters), but the HFS core still calls them. They are built in here,
+    # so make their declarations visible.
+    path = os.path.join(target, "hfs_encodings", "hfs_encodings.h")
+    text = open(path).read()
+    guard = "#if !TARGET_OS_IPHONE\n"
+    if text.count(guard) != 1:
+        sys.exit("ERROR: unexpected layout of %s" % path)
+    open(path, "w").write(text.replace(guard, "#if 1 /* A30S: converters are built in */\n"))
     print("  staged %s (%s)" % (HFS_TAG, HFS_SHA))
 
 

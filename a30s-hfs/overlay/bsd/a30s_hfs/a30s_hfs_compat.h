@@ -7,7 +7,9 @@
  * This is the iOS configuration of core/kext-config.h with content protection
  * off (there is no AppleKeyStore here).  kext-config.h itself is bypassed by
  * defining its include guard, because <TargetConditionals.h> is not available
- * to a -nostdinc kernel build.
+ * to a -nostdinc kernel build. The kext view of <kern/debug.h> does include that
+ * header, so a minimal TargetConditionals.h sits next to this file (it is on the
+ * include path via -I$(A30S_HFS_ROOT)).
  */
 #ifndef A30S_HFS_COMPAT_H
 #define A30S_HFS_COMPAT_H
@@ -20,6 +22,7 @@
 #undef CONFIG_HFS_DIRLINK
 #undef CONFIG_SECLUDED_RENAME
 #undef CONFIG_MACF
+#undef CONFIG_PGTRACE        /* pmap.h then needs arm_saved_state_t, absent in the kext view */
 #undef CONFIG_HFS_RBTREE
 #undef QUOTA
 #undef NAMEDSTREAMS

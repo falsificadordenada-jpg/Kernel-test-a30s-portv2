@@ -99,6 +99,7 @@ static struct {
 	bool ready;
 	bool logged;
 	bool handoff_ok;
+	uint32_t fifo_bytes;	/* Width of one FIFO word: 4 or 8 bytes (HCON[9:7]). */
 } se;
 
 static uint8_t emmc_gpt_sector[EMMC_BLOCK_SIZE];
@@ -122,6 +123,35 @@ static inline void
 emmc_wr(uint32_t off, uint32_t value)
 {
 	*(volatile uint32_t *)(se.regs + off) = value;
+}
+
+/*
+ * The data FIFO is as wide as the controller's data bus (HCON[9:7]: 1 = 32 bit,
+ * 2 = 64 bit). A 64-bit FIFO must be accessed with 64-bit loads/stores, and the
+ * STATUS FIFO count is expressed in FIFO-width words.
+ */
+static inline void
+emmc_fifo_pop(uint8_t *dst, uint32_t n)
+{
+	uint64_t value;
+	if (se.fifo_bytes == 8) {
+		value = *(volatile uint64_t *)(se.regs + EMMC_FIFO_OFFSET);
+	} else {
+		value = *(volatile uint32_t *)(se.regs + EMMC_FIFO_OFFSET);
+	}
+	memcpy(dst, &value, n);
+}
+
+static inline void
+emmc_fifo_push(const uint8_t *src, uint32_t n)
+{
+	uint64_t value = 0;
+	memcpy(&value, src, n);
+	if (se.fifo_bytes == 8) {
+		*(volatile uint64_t *)(se.regs + EMMC_FIFO_OFFSET) = value;
+	} else {
+		*(volatile uint32_t *)(se.regs + EMMC_FIFO_OFFSET) = (uint32_t)value;
+	}
 }
 
 static uint32_t
@@ -285,10 +315,8 @@ emmc_data_command(uint32_t index, uint32_t argument, bool write,
 		status = emmc_rd(REG_STATUS);
 		if (write) {
 			if (!(status & STATUS_FIFO_FULL)) {
-				uint32_t value = 0;
-				uint32_t n = MIN(bytes - done, (uint32_t)sizeof(value));
-				memcpy(&value, p + done, n);
-				emmc_wr(EMMC_FIFO_OFFSET, value);
+				uint32_t n = MIN(bytes - done, se.fifo_bytes);
+				emmc_fifo_push(p + done, n);
 				done += n;
 			}
 		} else if (!(status & STATUS_FIFO_EMPTY)) {
@@ -297,9 +325,8 @@ emmc_data_command(uint32_t index, uint32_t argument, bool write,
 				words = 1;
 			}
 			while (words-- && done < bytes) {
-				uint32_t value = emmc_rd(EMMC_FIFO_OFFSET);
-				uint32_t n = MIN(bytes - done, (uint32_t)sizeof(value));
-				memcpy(p + done, &value, n);
+				uint32_t n = MIN(bytes - done, se.fifo_bytes);
+				emmc_fifo_pop(p + done, n);
 				done += n;
 			}
 		}
@@ -489,9 +516,8 @@ emmc_initialize_card_inner(void)
 		while (done < sizeof(ext_csd)) {
 			uint32_t status = emmc_rd(REG_STATUS);
 			if (!(status & STATUS_FIFO_EMPTY)) {
-				uint32_t value = emmc_rd(EMMC_FIFO_OFFSET);
-				uint32_t n = MIN(sizeof(ext_csd) - done, sizeof(value));
-				memcpy(ext_csd + done, &value, n);
+				uint32_t n = MIN((uint32_t)sizeof(ext_csd) - done, se.fifo_bytes);
+				emmc_fifo_pop(ext_csd + done, n);
 				done += n;
 			} else if (mach_absolute_time() >= data_deadline) {
 				return ETIMEDOUT;
@@ -713,242 +739,3 @@ a30s_emmc_strategy(buf_t bp)
 				memcpy(emmc_bounce + skip, address + done, bytes);
 				error = emmc_transfer(lba, blocks, emmc_bounce, true);
 			}
-		}
-		if (error) {
-			break;
-		}
-		done += bytes;
-		buf_setresid(bp, count - done);
-	}
-	lck_mtx_unlock(a30s_emmc_lock);
-	buf_unmap(bp);
-finish:
-	if (error) {
-		buf_seterror(bp, error);
-	}
-	buf_biodone(bp);
-}
-
-static int
-a30s_emmc_ioctl(__unused dev_t dev, u_long command, caddr_t data,
-    __unused int flag, __unused struct proc *p, int is_char)
-{
-	uint32_t *value = (uint32_t *)data;
-	uint64_t *wide = (uint64_t *)data;
-	switch (command) {
-	case DKIOCGETBLOCKSIZE:
-		*value = se.secsize;
-		return 0;
-	case DKIOCSETBLOCKSIZE:
-		if (is_char) {
-			return ENODEV;
-		}
-		if (*value < DEV_BSIZE || *value > EMMC_BLOCK_SIZE ||
-		    (*value & (*value - 1))) {
-			return EINVAL;
-		}
-		se.secsize = *value;
-		return 0;
-	case DKIOCGETPHYSICALBLOCKSIZE:
-		*value = EMMC_BLOCK_SIZE;
-		return 0;
-	case DKIOCGETBLOCKCOUNT:
-		*wide = se.partition_sectors * EMMC_BLOCK_SIZE / se.secsize;
-		return 0;
-	case DKIOCISWRITABLE:
-		*value = se.writable;
-		return 0;
-	case DKIOCSYNCHRONIZE:
-	case DKIOCSYNCHRONIZECACHE:
-		if (!se.writable) {
-			return 0;
-		}
-		lck_mtx_lock(a30s_emmc_lock);
-		{
-			int error = emmc_flush_cache();
-			lck_mtx_unlock(a30s_emmc_lock);
-			return error;
-		}
-	case DKIOCGETMAXBLOCKCOUNTREAD:
-		*wide = EMMC_MAX_XFER / se.secsize;
-		return 0;
-	case DKIOCGETMAXBLOCKCOUNTWRITE:
-		*wide = se.writable ? EMMC_MAX_XFER / se.secsize : 0;
-		return 0;
-	case DKIOCGETMAXSEGMENTCOUNTREAD:
-	case DKIOCGETMAXSEGMENTCOUNTWRITE:
-		*wide = 1;
-		return 0;
-	default:
-		return ENOTTY;
-	}
-}
-
-static int
-a30s_emmc_bioctl(dev_t dev, u_long command, caddr_t data, int flag,
-    struct proc *p)
-{
-	return a30s_emmc_ioctl(dev, command, data, flag, p, 0);
-}
-
-static int
-a30s_emmc_cioctl(dev_t dev, u_long command, caddr_t data, int flag,
-    struct proc *p)
-{
-	return a30s_emmc_ioctl(dev, command, data, flag, p, 1);
-}
-
-static int
-a30s_emmc_psize(__unused dev_t dev)
-{
-	return se.ready ? (int)MIN(se.partition_sectors * EMMC_BLOCK_SIZE /
-	    se.secsize, INT_MAX) : -1;
-}
-
-static int
-a30s_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
-{
-	return physio(a30s_emmc_strategy, NULL, dev, B_READ, minphys, uio,
-	    (int)se.secsize);
-}
-
-static int
-a30s_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
-{
-	if (!se.writable) {
-		return EROFS;
-	}
-	return physio(a30s_emmc_strategy, NULL, dev, B_WRITE, minphys, uio,
-	    (int)se.secsize);
-}
-
-static const struct bdevsw a30s_emmc_bdevsw = {
-	.d_open     = a30s_emmc_open,
-	.d_close    = a30s_emmc_close,
-	.d_strategy = a30s_emmc_strategy,
-	.d_ioctl    = a30s_emmc_bioctl,
-	.d_dump     = eno_dump,
-	.d_psize    = a30s_emmc_psize,
-	.d_type     = D_DISK,
-};
-
-static const struct cdevsw a30s_emmc_cdevsw = {
-	.d_open       = a30s_emmc_open,
-	.d_close      = a30s_emmc_close,
-	.d_read       = a30s_emmc_read,
-	.d_write      = a30s_emmc_write,
-	.d_ioctl      = a30s_emmc_cioctl,
-	.d_stop       = eno_stop,
-	.d_reset      = eno_reset,
-	.d_ttys       = NULL,
-	.d_select     = eno_select,
-	.d_mmap       = eno_mmap,
-	.d_strategy   = eno_strat,
-	.d_reserved_1 = eno_getc,
-	.d_reserved_2 = eno_putc,
-	.d_type       = D_DISK,
-};
-
-static int
-emmc_map_controller(void)
-{
-	if (se.regs != 0) {
-		return 0;
-	}
-	se.regs = ml_io_map((vm_offset_t)EMMC_PHYS_BASE, (vm_size_t)EMMC_REG_SIZE);
-	return se.regs == 0 ? ENXIO : 0;
-}
-
-static int
-a30s_emmc_init(void)
-{
-	char partition[64] = "userdata";
-	uint32_t rw = 0;
-	int error = emmc_map_controller();
-
-	if (error != 0) {
-		return error;
-	}
-	uint32_t force = 0;
-
-	PE_parse_boot_argn("emmcroot", partition, sizeof(partition));
-	PE_parse_boot_argn("emmcw", &rw, sizeof(rw));
-	PE_parse_boot_argn("emmc_force", &force, sizeof(force));
-	if (!se.logged) {
-		se.logged = true;
-		printf("A30S eMMC: handoff ctrl=%08x pwren=%08x clkena=%08x clkdiv=%08x clksel=%08x uhs=%08x status=%08x rintsts=%08x\n",
-		    emmc_rd(REG_CTRL), emmc_rd(REG_PWREN), emmc_rd(REG_CLKENA),
-		    emmc_rd(REG_CLKDIV), emmc_rd(REG_CLKSEL), emmc_rd(REG_UHS),
-		    emmc_rd(REG_STATUS), emmc_rd(REG_RINTSTS));
-	}
-	if (a30s_emmc_lock == NULL) {
-		a30s_emmc_grp = lck_grp_alloc_init("a30s_emmc", LCK_GRP_ATTR_NULL);
-		a30s_emmc_lock = lck_mtx_alloc_init(a30s_emmc_grp, LCK_ATTR_NULL);
-	}
-	/* The handoff check only makes sense on the first attempt: a failed attempt changes the clock state itself. */
-	if (!force && !se.handoff_ok && (emmc_rd(REG_VERID) != 0x5342270au ||
-	    emmc_rd(REG_HCON) != 0x08e42541u ||
-	    ((emmc_rd(REG_CLKSEL) >> 24) & 7u) != 3u ||
-	    !(emmc_rd(REG_PWREN) & 1u) || !(emmc_rd(REG_CLKENA) & 1u))) {
-		printf("A30S eMMC: unexpected controller handoff (ver=%08x hcon=%08x clksel=%08x pwren=%08x clkena=%08x)\n",
-		    emmc_rd(REG_VERID), emmc_rd(REG_HCON), emmc_rd(REG_CLKSEL),
-		    emmc_rd(REG_PWREN), emmc_rd(REG_CLKENA));
-		return ENXIO;
-	}
-	se.handoff_ok = true;
-	if (!force && (emmc_rd(REG_CTRL) & (CTRL_DMA_ENABLE | CTRL_USE_IDMAC))) {
-		printf("A30S eMMC: refusing host with DMA active (ctrl=%08x)\n",
-		    emmc_rd(REG_CTRL));
-		return ENXIO;
-	}
-	emmc_wr(REG_INTMASK, 0);
-	emmc_wr(REG_CTRL, emmc_rd(REG_CTRL) & ~CTRL_INT_ENABLE);
-	se.secsize = DEV_BSIZE;
-
-	lck_mtx_lock(a30s_emmc_lock);
-	error = emmc_initialize_card();
-	if (!error) {
-		error = emmc_find_partition(partition);
-	}
-	lck_mtx_unlock(a30s_emmc_lock);
-	if (error) {
-		printf("A30S eMMC: initialization failed: %d\n", error);
-		return error;
-	}
-	se.bmajor = bdevsw_add(-1, &a30s_emmc_bdevsw);
-	if (se.bmajor < 0) {
-		return ENXIO;
-	}
-	se.cmajor = cdevsw_add_with_bdev(-1, &a30s_emmc_cdevsw, se.bmajor);
-	if (se.cmajor < 0) {
-		return ENXIO;
-	}
-	se.bdev = makedev(se.bmajor, 0);
-	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
-	    "emmcroot0");
-	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT,
-	    GID_OPERATOR, 0640, "remmcroot0");
-	/* Enable writes only after the selected partition has been bounded. */
-	se.writable = (rw == 1);
-	se.ready = true;
-	printf("A30S eMMC: \"%s\": LBA 0x%llx, %llu MiB, %s, 8-bit PIO\n",
-	    partition, se.first_sector,
-	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
-	    se.writable ? "read-write" : "read-only");
-	return 0;
-}
-
-int
-a30s_emmc_rootdev(dev_t *dev)
-{
-	if (!se.ready) {
-		int error = a30s_emmc_init();
-		if (error != 0) {
-			return error;
-		}
-	}
-	*dev = se.bdev;
-	return 0;
-}
-
-#endif /* ARM64_BOARD_CONFIG_A30S */

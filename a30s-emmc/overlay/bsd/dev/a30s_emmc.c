@@ -757,4 +757,58 @@ a30s_emmc_init(void)
 	}
 	se.handoff_ok = true;
 	if (!force && (emmc_rd(REG_CTRL) & (CTRL_DMA_ENABLE | CTRL_USE_IDMAC))) {
-		printf("A30S eMMC: refusing host with DMA a
+		printf("A30S eMMC: refusing host with DMA active (ctrl=%08x)\n",
+		    emmc_rd(REG_CTRL));
+		return ENXIO;
+	}
+	emmc_wr(REG_INTMASK, 0);
+	emmc_wr(REG_CTRL, emmc_rd(REG_CTRL) & ~CTRL_INT_ENABLE);
+	se.secsize = DEV_BSIZE;
+
+	lck_mtx_lock(a30s_emmc_lock);
+	error = emmc_initialize_card();
+	if (!error) {
+		error = emmc_find_partition(partition);
+	}
+	lck_mtx_unlock(a30s_emmc_lock);
+	if (error) {
+		printf("A30S eMMC: initialization failed: %d\n", error);
+		return error;
+	}
+	se.bmajor = bdevsw_add(-1, &a30s_emmc_bdevsw);
+	if (se.bmajor < 0) {
+		return ENXIO;
+	}
+	se.cmajor = cdevsw_add_with_bdev(-1, &a30s_emmc_cdevsw, se.bmajor);
+	if (se.cmajor < 0) {
+		return ENXIO;
+	}
+	se.bdev = makedev(se.bmajor, 0);
+	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
+	    "emmcroot0");
+	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT,
+	    GID_OPERATOR, 0640, "remmcroot0");
+	/* Enable writes only after the selected partition has been bounded. */
+	se.writable = (rw == 1);
+	se.ready = true;
+	printf("A30S eMMC: \"%s\": LBA 0x%llx, %llu MiB, %s, 8-bit PIO\n",
+	    partition, se.first_sector,
+	    se.partition_sectors * EMMC_BLOCK_SIZE >> 20,
+	    se.writable ? "read-write" : "read-only");
+	return 0;
+}
+
+int
+a30s_emmc_rootdev(dev_t *dev)
+{
+	if (!se.ready) {
+		int error = a30s_emmc_init();
+		if (error != 0) {
+			return error;
+		}
+	}
+	*dev = se.bdev;
+	return 0;
+}
+
+#endif /* ARM64_BOARD_CONFIG_A30S */
